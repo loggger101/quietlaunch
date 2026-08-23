@@ -31,6 +31,7 @@ is read by the same eyes.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import socket
@@ -43,7 +44,18 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(HERE, "ui.py")
 LOG_DIR = os.path.join(HERE, ".launcher")
-LOG = os.path.join(LOG_DIR, "dashboard.log")
+
+# Per PORT, not one shared file: two launchers on different ports would both
+# truncate a single dashboard.log, and the surviving copy would be the wrong
+# one exactly when somebody is trying to read it to find out why the other
+# failed.
+def _log_path(port):
+    return os.path.join(LOG_DIR, "dashboard-%d.log" % port)
+
+
+# Names the server THIS launcher started, so a later launch can tell our
+# dashboard from any other Streamlit app that happens to hold the port.
+MARKER = os.path.join(LOG_DIR, "running.json")
 
 # Streamlit's default, then upwards. A second launch lands on the next free one
 # rather than fighting the first.
@@ -54,6 +66,10 @@ PORT_TRIES = 12
 # yfinance behind it. On a Drive File Stream working copy that read is slow and
 # serialises, so this is minutes rather than seconds the first time.
 BOOT_TIMEOUT_S = 300.0
+
+# How long main() waits for the boot thread to stand down before exiting. Only
+# ever reached when the window is closed mid-boot; see Launcher.finish.
+JOIN_TIMEOUT_S = 15.0
 
 # How often the main thread drains the worker's queue. Fast enough that status
 # lines look immediate, slow enough to be free.
@@ -131,13 +147,14 @@ def _port_answers(port, timeout=0.4):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _is_our_dashboard(port):
-    """True if something on this port is a live Streamlit server.
+def _is_streamlit_server(port):
+    """True if something on this port is a live Streamlit server -- ANY of them.
 
-    Used so that double-clicking the shortcut twice reopens the dashboard that
-    is already up instead of starting a second copy of a program that loads a
-    1 MB module. `/_stcore/health` answers `ok` and has since Streamlit 1.19;
-    anything else on the port fails the request or answers something else.
+    `/_stcore/health` answers `ok` and has since Streamlit 1.19; anything else
+    on the port fails the request or answers something else. Note what this
+    canNOT tell you: whether the app being served is ours. That is the marker
+    file's job, and conflating the two is how a double-click would have opened
+    somebody else's Streamlit project because it got to 8501 first.
     """
     import urllib.request
     try:
@@ -146,6 +163,52 @@ def _is_our_dashboard(port):
             return r.read(32).strip().lower() == b"ok"
     except Exception:
         return False
+
+
+def _write_marker(port, pid):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(MARKER, "w", encoding="utf-8") as f:
+            json.dump({"port": port, "pid": pid, "started": time.time()}, f)
+    except (OSError, TypeError, ValueError):
+        pass                       # a launcher that cannot write a note still works
+
+
+def _read_marker():
+    try:
+        with open(MARKER, encoding="utf-8") as f:
+            d = json.load(f)
+        return int(d["port"]), int(d["pid"])
+    except Exception:
+        return None, None
+
+
+def _clear_marker():
+    try:
+        os.remove(MARKER)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid):
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    import ctypes.wintypes as wt
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)     # QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = wt.DWORD()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        return bool(ok) and code.value == 259   # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
 
 
 def _choose_port():
@@ -157,11 +220,19 @@ def _choose_port():
     semantics to detect a live server, which is what the SO_REUSEADDR note
     above is about.
     """
+    port, pid = _read_marker()
+    if (port and pid and _pid_alive(pid) and _port_answers(port)
+            and _is_streamlit_server(port)):
+        return port, True                   # our own dashboard, still up
+
+    # All three conditions matter. The pid check rejects a marker left behind
+    # by a crash; the health check rejects a pid that Windows has recycled onto
+    # some unrelated process; and reaching here at all means we will not adopt
+    # a Streamlit server we did not start.
+    _clear_marker()
     for port in range(PORT_FIRST, PORT_FIRST + PORT_TRIES):
         if _port_answers(port):
-            if _is_our_dashboard(port):
-                return port, True
-            continue                        # somebody else's server; move on
+            continue                        # somebody is there; do not disturb
         if _port_is_free(port):
             return port, False
     return PORT_FIRST, False
@@ -183,7 +254,7 @@ def _tail(path, lines=14):
 def _start_streamlit(port):
     """Spawn the server. Returns (Popen, logfile_handle)."""
     os.makedirs(LOG_DIR, exist_ok=True)
-    log = open(LOG, "w", encoding="utf-8", errors="replace")
+    log = open(_log_path(port), "w", encoding="utf-8", errors="replace")
     cmd = [
         _console_python(), "-m", "streamlit", "run", APP,
         # headless keeps Streamlit from opening its own browser -- this file
@@ -240,14 +311,22 @@ def _stop(proc):
 # Dependencies
 # --------------------------------------------------------------------------
 
-def _streamlit_present():
+def _streamlit_installed():
+    """Is Streamlit importable?
+
+    `importlib.util.find_spec` searches the path without importing, so this
+    costs microseconds where spawning `python -c "import streamlit"` cost about
+    1.5 s -- a third of a warm launch, paid on every single one. It is the same
+    interpreter either way: _console_python() is derived from sys.executable,
+    so it shares this process's site-packages.
+
+    It answers "installed", not "importable without error". A broken install
+    passes here and then fails at spawn -- where the log tail reports the real
+    ImportError, which is a better message than this function could produce.
+    """
     try:
-        out = subprocess.run(
-            [_console_python(), "-c", "import streamlit"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=_NO_WINDOW, timeout=120,
-        )
-        return out.returncode == 0
+        import importlib.util
+        return importlib.util.find_spec("streamlit") is not None
     except Exception:
         return False
 
@@ -283,8 +362,14 @@ class Launcher(object):
         self.tk, self.ttk = tk, ttk
         self.root = root
         self.work = queue.Queue()
+        # Guards the (proc, logfile, stopping) trio ONLY. Held for the moment
+        # it takes to hand the child over, never across _stop -- taskkill can
+        # take seconds and the worker must not block on it.
+        self.lock = threading.Lock()
         self.proc = None
         self.logfile = None
+        self.log_path = None
+        self.thread = None
         self.port = None
         self.url = ""
         self.ready = False
@@ -395,9 +480,11 @@ class Launcher(object):
             webbrowser.open(self.url)
 
     def quit(self):
-        if self.stopping:
-            return
-        self.stopping = True
+        with self.lock:
+            if self.stopping:
+                return
+            self.stopping = True
+            proc, logfile = self.proc, self.logfile
         # Cancel the queued pump before tearing the window down. Setting
         # `stopping` only stops it RESCHEDULING; the one already in flight
         # still fires, into a destroyed interpreter, and Tcl prints
@@ -412,17 +499,49 @@ class Launcher(object):
         self._say("Stopping the dashboard...")
         self._pump_once()
         self.root.update_idletasks()
-        _stop(self.proc)
-        if self.logfile is not None:
+        _stop(proc)
+        if proc is not None:
+            _clear_marker()
+        if logfile is not None:
             try:
-                self.logfile.close()
+                logfile.close()
             except Exception:
                 pass
         self.root.destroy()
 
     # -- the boot sequence, on a worker thread ------------------------------
     def boot(self):
-        threading.Thread(target=self._boot, daemon=True).start()
+        self.thread = threading.Thread(target=self._boot, daemon=True)
+        self.thread.start()
+
+    def finish(self):
+        """Called after the main loop ends. The last chance to not leak a server.
+
+        The boot thread is a daemon, so returning from main() kills it wherever
+        it happens to be -- and if that is one statement past Popen, the child
+        is already alive and nothing has been recorded that could stop it. The
+        lock makes the hand-over atomic; this makes sure the hand-over actually
+        HAPPENS, by giving the thread a bounded moment to notice `stopping` and
+        clean up after itself. Without it the lock protects a window the
+        interpreter never lives long enough to reach.
+
+        Bounded, not indefinite: a thread stuck in pip cannot hold the process
+        open. That case is safe anyway -- it has not spawned anything yet, so
+        being killed leaks nothing.
+        """
+        if self.thread is not None:
+            self.thread.join(timeout=JOIN_TIMEOUT_S)
+        with self.lock:
+            proc, logfile = self.proc, self.logfile
+            self.proc, self.logfile = None, None
+        if proc is not None:
+            _stop(proc)                     # a no-op if quit() already did it
+            _clear_marker()
+        if logfile is not None:
+            try:
+                logfile.close()
+            except Exception:
+                pass
 
     def _boot(self):
         try:
@@ -441,7 +560,7 @@ class Launcher(object):
                                "Looked in: %s" % HERE)
             return
 
-        if not _streamlit_present():
+        if not _streamlit_installed():
             self._say("Installing Streamlit (one time, a minute or two)...",
                       "pip install -r requirements-ui.txt")
             if not _pip_install_streamlit():
@@ -449,9 +568,13 @@ class Launcher(object):
                     False, "Could not install Streamlit.",
                     "See .launcher/install.log")
                 return
+        if self.stopping:
+            return                  # closed during the install; spawn nothing
 
         self.port, running = _choose_port()
         self.url = "http://localhost:%d" % self.port
+        if self.stopping:
+            return
 
         if running:
             # Someone double-clicked twice, or left it running. Reopening beats
@@ -469,18 +592,47 @@ class Launcher(object):
 
         self._say("Starting the server on port %d..." % self.port,
                   "First run loads the pipeline, which takes a minute.")
-        self.proc, self.logfile = _start_streamlit(self.port)
 
+        # THE HAND-OVER, and it has to be atomic against quit().
+        #
+        # Popen returns with the child already alive. Assigning it afterwards
+        # leaves a window -- tens of milliseconds, but reproducible -- in which
+        # the user closes the window, quit() finds self.proc still None, kills
+        # nothing, and the server is left holding the port with the only thing
+        # that could have stopped it now gone. Under the lock, exactly one of
+        # the two sides owns the child: if `stopping` is already set we stop
+        # what we just started, otherwise quit() is guaranteed to see it.
+        proc, logfile = _start_streamlit(self.port)
+        with self.lock:
+            abandoned = self.stopping
+            if not abandoned:
+                self.proc, self.logfile = proc, logfile
+                self.log_path = _log_path(self.port)
+        if abandoned:
+            _stop(proc)
+            try:
+                logfile.close()
+            except Exception:
+                pass
+            return
+
+        log_note = "See %s" % os.path.relpath(self.log_path, HERE)
         deadline = time.time() + BOOT_TIMEOUT_S
         while time.time() < deadline:
             if self.stopping:
                 return
-            if self.proc.poll() is not None:
+            if proc.poll() is not None:
                 self._done_booting(
                     False, "The server stopped while starting up.",
-                    _tail(LOG) or "See .launcher/dashboard.log")
+                    _tail(self.log_path) or log_note)
                 return
             if _port_answers(self.port):
+                # Recorded only once the server actually answers, so the marker
+                # never advertises a dashboard that is not there yet. It also
+                # survives this launcher being killed, which is what lets the
+                # next double-click adopt an already-running server instead of
+                # starting a second one.
+                _write_marker(self.port, proc.pid)
                 self._done_booting(True, "The dashboard is running.", self.url)
                 self._post(self.open_browser)
                 return
@@ -489,7 +641,7 @@ class Launcher(object):
         self._done_booting(
             False, "The server did not come up within %d seconds."
                    % int(BOOT_TIMEOUT_S),
-            _tail(LOG) or "See .launcher/dashboard.log")
+            _tail(self.log_path) or log_note)
 
 
 def main():
@@ -502,11 +654,15 @@ def main():
         port, running = _choose_port()
         url = "http://localhost:%d" % port
         if not running:
-            _start_streamlit(port)
+            proc, logfile = _start_streamlit(port)
             for _ in range(int(BOOT_TIMEOUT_S * 4)):
                 if _port_answers(port):
+                    _write_marker(port, proc.pid)
+                    break
+                if proc.poll() is not None:
                     break
                 time.sleep(0.25)
+            logfile.close()
         webbrowser.open(url)
         _message_box("Asteroid Pipeline",
                      "The dashboard is at %s\n\n"
@@ -524,6 +680,7 @@ def main():
     app = Launcher(root, tk, ttk)
     app.boot()
     root.mainloop()
+    app.finish()
     return 0
 
 
