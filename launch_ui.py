@@ -1,0 +1,531 @@
+# -*- coding: utf-8 -*-
+"""Start the dashboard with no terminal window, and give it something to close.
+
+    pyw -3 launch_ui.py          (what Dashboard.vbs runs)
+    py  -3 launch_ui.py          (same thing, with a console to watch)
+
+WHY THIS EXISTS. `run.bat ui` runs `streamlit run ui.py` in the foreground, so
+the console window IS the app: closing it stops the server, and it has to stay
+open and in the way for as long as the dashboard is up. That is the terminal
+this file removes.
+
+Removing it costs more than hiding it, which is the whole design here. A
+`pythonw` process with no console has no window to close and no output to read,
+so a failed start is a program that silently does not appear, and a successful
+one is a server nobody can stop without Task Manager. So this launcher puts up
+a small control window instead: it says what is happening while Streamlit boots,
+opens the browser once the port actually answers, and stops the server when it
+is closed. The window replaces the console rather than merely suppressing it.
+
+NOT A SECOND ENTRY POINT TO THE MODEL. It never imports master, ui, or anything
+under modules/ -- it spawns `streamlit run ui.py` as a child and watches a
+socket. That is deliberate: this process is the one thing that must not fail,
+and importing the pipeline here would put a 1 MB module and a multiprocessing
+pool inside the supervisor. It also sidesteps `_spawn_environment` entirely,
+since nothing here is ever a worker's `__main__`.
+
+ASCII ONLY, like the rest of the pipeline's output. Nothing here is printed to
+a redirected stdout, but the rule is cheap to keep and the log file this writes
+is read by the same eyes.
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import socket
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+APP = os.path.join(HERE, "ui.py")
+LOG_DIR = os.path.join(HERE, ".launcher")
+LOG = os.path.join(LOG_DIR, "dashboard.log")
+
+# Streamlit's default, then upwards. A second launch lands on the next free one
+# rather than fighting the first.
+PORT_FIRST = 8501
+PORT_TRIES = 12
+
+# Cold start imports master.py, which is ~1 MB and pulls pandas, numpy and
+# yfinance behind it. On a Drive File Stream working copy that read is slow and
+# serialises, so this is minutes rather than seconds the first time.
+BOOT_TIMEOUT_S = 300.0
+
+# How often the main thread drains the worker's queue. Fast enough that status
+# lines look immediate, slow enough to be free.
+POLL_MS = 80
+
+# CREATE_NO_WINDOW. The child is a console program; without this it opens the
+# very window this file exists to remove.
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+# --------------------------------------------------------------------------
+# Talking to the user without a console
+# --------------------------------------------------------------------------
+
+def _message_box(title, text):
+    """Last-resort dialog, for failures that happen before tkinter is up."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
+            return
+        except Exception:
+            pass
+    # A console may not exist. If it does, this is better than nothing.
+    try:
+        sys.stderr.write(title + "\n\n" + text + "\n")
+    except Exception:
+        pass
+
+
+def _console_python():
+    """The console interpreter beside whatever is running this.
+
+    Under `pyw`, sys.executable is pythonw.exe, whose stdout is None. Streamlit
+    writes to stdout on startup and its own child processes inherit those
+    handles, so launching it from pythonw is a way to find out which libraries
+    handle a None stdout badly. Hand the child a real python.exe and redirect it
+    to a file instead -- then the log below is a real log.
+    """
+    exe = sys.executable or ""
+    base = os.path.basename(exe).lower()
+    if base.startswith("pythonw"):
+        cand = os.path.join(os.path.dirname(exe),
+                            os.path.basename(exe).replace("pythonw", "python", 1))
+        if os.path.isfile(cand):
+            return cand
+    return exe
+
+
+# --------------------------------------------------------------------------
+# Ports
+# --------------------------------------------------------------------------
+
+def _port_is_free(port):
+    """Can we actually take this port?
+
+    Deliberately no SO_REUSEADDR. On Unix that option means "reuse a port stuck
+    in TIME_WAIT"; on WINDOWS it means "bind even though someone else already
+    has it", so setting it made this return True for a port Streamlit was
+    serving at that moment -- which sent the caller off to start a second
+    server on an occupied port. Whether a port is taken is answered by
+    _port_answers; this only confirms we can bind the one nobody holds.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _port_answers(port, timeout=0.4):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _is_our_dashboard(port):
+    """True if something on this port is a live Streamlit server.
+
+    Used so that double-clicking the shortcut twice reopens the dashboard that
+    is already up instead of starting a second copy of a program that loads a
+    1 MB module. `/_stcore/health` answers `ok` and has since Streamlit 1.19;
+    anything else on the port fails the request or answers something else.
+    """
+    import urllib.request
+    try:
+        url = "http://127.0.0.1:%d/_stcore/health" % port
+        with urllib.request.urlopen(url, timeout=1.0) as r:
+            return r.read(32).strip().lower() == b"ok"
+    except Exception:
+        return False
+
+
+def _choose_port():
+    """(port, already_running). Reuses a dashboard that is already up.
+
+    Listening is tested before bindability, not after: "is something there" is
+    a question about the network, and only once nothing is there does it matter
+    whether we could bind. Written the other way round it depends on bind
+    semantics to detect a live server, which is what the SO_REUSEADDR note
+    above is about.
+    """
+    for port in range(PORT_FIRST, PORT_FIRST + PORT_TRIES):
+        if _port_answers(port):
+            if _is_our_dashboard(port):
+                return port, True
+            continue                        # somebody else's server; move on
+        if _port_is_free(port):
+            return port, False
+    return PORT_FIRST, False
+
+
+# --------------------------------------------------------------------------
+# The child process
+# --------------------------------------------------------------------------
+
+def _tail(path, lines=14):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            got = f.read().splitlines()
+    except OSError:
+        return ""
+    return "\n".join(got[-lines:]).strip()
+
+
+def _start_streamlit(port):
+    """Spawn the server. Returns (Popen, logfile_handle)."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log = open(LOG, "w", encoding="utf-8", errors="replace")
+    cmd = [
+        _console_python(), "-m", "streamlit", "run", APP,
+        # headless keeps Streamlit from opening its own browser -- this file
+        # opens it once the port actually answers, which is a different moment
+        # -- and suppresses the first-run email prompt, which would otherwise
+        # sit unanswered on a stdin nobody can reach.
+        "--server.headless=true",
+        "--server.port=%d" % port,
+        "--browser.gatherUsageStats=false",
+    ]
+    env = dict(os.environ)
+    # Same belt and braces as run.bat: the pipeline's own output is ASCII, but
+    # tqdm, tracebacks and data values reach this log too.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.Popen(
+        cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, env=env, creationflags=_NO_WINDOW,
+    )
+    return proc, log
+
+
+def _stop(proc):
+    """Kill the server AND its children.
+
+    Streamlit's file watcher and the pipeline's own worker pool are separate
+    processes. Terminating only the one we spawned orphans them, and an orphaned
+    worker holds the port -- so the next launch finds 8501 busy and not
+    answering health, picks 8502, and the stale one lingers until reboot.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=_NO_WINDOW, timeout=15,
+            )
+            return
+        except Exception:
+            pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Dependencies
+# --------------------------------------------------------------------------
+
+def _streamlit_present():
+    try:
+        out = subprocess.run(
+            [_console_python(), "-c", "import streamlit"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW, timeout=120,
+        )
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def _pip_install_streamlit():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    req = os.path.join(HERE, "requirements-ui.txt")
+    args = ["-r", req] if os.path.isfile(req) else ["streamlit>=1.30"]
+    with open(os.path.join(LOG_DIR, "install.log"), "w",
+              encoding="utf-8", errors="replace") as log:
+        rc = subprocess.run(
+            [_console_python(), "-m", "pip", "install"] + args,
+            cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW,
+        ).returncode
+    return rc == 0
+
+
+# --------------------------------------------------------------------------
+# The control window
+# --------------------------------------------------------------------------
+
+class Launcher(object):
+    """A window that boots the dashboard, then stands in for the console.
+
+    Built and shown BEFORE anything slow happens, so a cold start looks like a
+    program starting rather than a double-click that did nothing. Everything
+    slow runs on a worker thread and reports back through `_say`; tkinter is
+    not thread-safe, so the worker never touches a widget directly.
+    """
+
+    def __init__(self, root, tk, ttk):
+        self.tk, self.ttk = tk, ttk
+        self.root = root
+        self.work = queue.Queue()
+        self.proc = None
+        self.logfile = None
+        self.port = None
+        self.url = ""
+        self.ready = False
+        self.finished = False       # boot sequence has reported, pass or fail
+        self.stopping = False
+        self.pump_id = None
+
+        root.title("Asteroid Pipeline")
+        root.geometry("470x230")
+        root.minsize(470, 230)
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+
+        frame = ttk.Frame(root, padding=18)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Asteroid mining profitability pipeline",
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="Dashboard",
+                  font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 12))
+
+        self.status = ttk.Label(frame, text="Starting...", font=("Segoe UI", 9),
+                                wraplength=420, justify="left")
+        self.status.pack(anchor="w")
+
+        self.detail = ttk.Label(frame, text="", font=("Consolas", 8),
+                                foreground="#666666", wraplength=420,
+                                justify="left")
+        self.detail.pack(anchor="w", pady=(4, 0))
+
+        self.bar = ttk.Progressbar(frame, mode="indeterminate", length=420)
+        self.bar.pack(anchor="w", pady=(12, 0))
+        self.bar.start(12)
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(side="bottom", anchor="w", pady=(16, 0))
+        self.open_btn = ttk.Button(buttons, text="Open dashboard",
+                                   command=self.open_browser, state="disabled")
+        self.open_btn.pack(side="left")
+        ttk.Button(buttons, text="Stop and quit",
+                   command=self.quit).pack(side="left", padx=(8, 0))
+
+        self.pump_id = self.root.after(POLL_MS, self._pump)
+
+    # -- thread-safe reporting ---------------------------------------------
+    #
+    # The worker thread NEVER touches tkinter, not even through `after`.
+    # `Tk.after` registers a Tcl command, which is not thread-safe, and it
+    # raises outright once the main loop has gone -- so a user closing the
+    # window during the four seconds Streamlit takes to boot produced
+    # `RuntimeError: main thread is not in main loop` from inside the worker,
+    # where nothing under pythonw would ever have shown it. Instead the worker
+    # posts a callable and the main thread runs it. Queue.put is thread-safe;
+    # this is the only channel between the two.
+
+    def _post(self, fn):
+        self.work.put(fn)
+
+    def _pump_once(self):
+        """Drain the queue on the main thread without rescheduling."""
+        while True:
+            try:
+                fn = self.work.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _pump(self):
+        while True:
+            try:
+                fn = self.work.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                pass                      # a dead widget must not stop the pump
+        if not self.stopping:
+            try:
+                self.pump_id = self.root.after(POLL_MS, self._pump)
+            except Exception:
+                pass
+
+    def _say(self, text, detail=None):
+        def apply():
+            self.status.configure(text=text)
+            if detail is not None:
+                self.detail.configure(text=detail)
+        self._post(apply)
+
+    def _done_booting(self, ok, message, detail=""):
+        def apply():
+            self.bar.stop()
+            self.bar.pack_forget()
+            self.finished = True
+            self.status.configure(text=message)
+            self.detail.configure(text=detail)
+            if ok:
+                self.ready = True
+                self.open_btn.configure(state="normal")
+        self._post(apply)
+
+    # -- actions ------------------------------------------------------------
+    def open_browser(self):
+        if self.url:
+            webbrowser.open(self.url)
+
+    def quit(self):
+        if self.stopping:
+            return
+        self.stopping = True
+        # Cancel the queued pump before tearing the window down. Setting
+        # `stopping` only stops it RESCHEDULING; the one already in flight
+        # still fires, into a destroyed interpreter, and Tcl prints
+        # `invalid command name "..._pump"` -- which under pythonw goes
+        # nowhere at all and is exactly the kind of thing that stays broken.
+        if self.pump_id is not None:
+            try:
+                self.root.after_cancel(self.pump_id)
+            except Exception:
+                pass
+            self.pump_id = None
+        self._say("Stopping the dashboard...")
+        self._pump_once()
+        self.root.update_idletasks()
+        _stop(self.proc)
+        if self.logfile is not None:
+            try:
+                self.logfile.close()
+            except Exception:
+                pass
+        self.root.destroy()
+
+    # -- the boot sequence, on a worker thread ------------------------------
+    def boot(self):
+        threading.Thread(target=self._boot, daemon=True).start()
+
+    def _boot(self):
+        try:
+            self._boot_inner()
+        except Exception as exc:                       # never die silently
+            try:
+                self._done_booting(
+                    False, "The launcher hit an error.",
+                    "%s: %s" % (type(exc).__name__, exc))
+            except Exception:
+                pass          # reporting a failure must not raise a second one
+
+    def _boot_inner(self):
+        if not os.path.isfile(APP):
+            self._done_booting(False, "ui.py is not next to this launcher.",
+                               "Looked in: %s" % HERE)
+            return
+
+        if not _streamlit_present():
+            self._say("Installing Streamlit (one time, a minute or two)...",
+                      "pip install -r requirements-ui.txt")
+            if not _pip_install_streamlit():
+                self._done_booting(
+                    False, "Could not install Streamlit.",
+                    "See .launcher/install.log")
+                return
+
+        self.port, running = _choose_port()
+        self.url = "http://localhost:%d" % self.port
+
+        if running:
+            # Someone double-clicked twice, or left it running. Reopening beats
+            # a second copy of a program that loads a 1 MB module.
+            #
+            # And then this process GOES AWAY. It supervises nothing -- proc is
+            # None -- so leaving its window up would put a second "Stop and
+            # quit" button on screen that cannot stop anything, next to the one
+            # that can. One dashboard, one control window.
+            self._done_booting(True, "Already running -- reopening it in your"
+                                     " browser.", self.url)
+            self._post(self.open_browser)
+            self._post(lambda: self.root.after(1600, self.quit))
+            return
+
+        self._say("Starting the server on port %d..." % self.port,
+                  "First run loads the pipeline, which takes a minute.")
+        self.proc, self.logfile = _start_streamlit(self.port)
+
+        deadline = time.time() + BOOT_TIMEOUT_S
+        while time.time() < deadline:
+            if self.stopping:
+                return
+            if self.proc.poll() is not None:
+                self._done_booting(
+                    False, "The server stopped while starting up.",
+                    _tail(LOG) or "See .launcher/dashboard.log")
+                return
+            if _port_answers(self.port):
+                self._done_booting(True, "The dashboard is running.", self.url)
+                self._post(self.open_browser)
+                return
+            time.sleep(0.25)
+
+        self._done_booting(
+            False, "The server did not come up within %d seconds."
+                   % int(BOOT_TIMEOUT_S),
+            _tail(LOG) or "See .launcher/dashboard.log")
+
+
+def main():
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception:
+        # No tkinter: fall back to a plain start with a message box, which is
+        # worse (nothing to close) but better than doing nothing at all.
+        port, running = _choose_port()
+        url = "http://localhost:%d" % port
+        if not running:
+            _start_streamlit(port)
+            for _ in range(int(BOOT_TIMEOUT_S * 4)):
+                if _port_answers(port):
+                    break
+                time.sleep(0.25)
+        webbrowser.open(url)
+        _message_box("Asteroid Pipeline",
+                     "The dashboard is at %s\n\n"
+                     "tkinter is missing, so there is no control window -- "
+                     "stop the server from Task Manager when you are done."
+                     % url)
+        return 0
+
+    root = tk.Tk()
+    try:
+        root.iconify()
+        root.deiconify()
+    except Exception:
+        pass
+    app = Launcher(root, tk, ttk)
+    app.boot()
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
