@@ -4,10 +4,12 @@
     pyw -3 launch_ui.py          (what Dashboard.vbs runs)
     py  -3 launch_ui.py          (same thing, with a console to watch)
 
-WHY THIS EXISTS. `run.bat ui` runs `streamlit run ui.py` in the foreground, so
-the console window IS the app: closing it stops the server, and it has to stay
-open and in the way for as long as the dashboard is up. That is the terminal
-this file removes.
+WHY THIS EXISTS. `run.bat ui` USED TO run `streamlit run ui.py` in the
+foreground, so the console window WAS the app: closing it stopped the server,
+and it had to stay open and in the way for as long as the dashboard was up.
+That is the terminal this file removes. `run.bat ui` now hands off to
+Dashboard.vbs, which runs this, and falls back to the foreground server only
+when Dashboard.vbs is missing.
 
 Removing it costs more than hiding it, which is the whole design here. A
 `pythonw` process with no console has no window to close and no output to read,
