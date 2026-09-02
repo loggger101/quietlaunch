@@ -52,6 +52,12 @@ LOG_DIR = os.path.join(HERE, ".launcher")
 # one exactly when somebody is trying to read it to find out why the other
 # failed.
 def _log_path(port):
+    """Where the server's stdout goes, named by PORT.
+
+    Per port rather than one shared file: two launchers would both truncate a
+    single dashboard.log, and the surviving copy would be the wrong one exactly
+    when somebody is reading it to find out why the other failed.
+    """
     return os.path.join(LOG_DIR, "dashboard-%d.log" % port)
 
 
@@ -406,6 +412,12 @@ class Launcher(object):
     """
 
     def __init__(self, root, tk, ttk):
+        """Build the window and the worker-to-UI queue. Nothing slow yet.
+
+        `tk` and `ttk` are passed in rather than imported at module scope,
+        because `main()` has to be able to fall back when tkinter is missing,
+        and an import at the top would take the whole launcher down with it.
+        """
         self.tk, self.ttk = tk, ttk
         self.root = root
         self.work = queue.Queue()
@@ -513,6 +525,7 @@ class Launcher(object):
     def _say(self, text, detail=None):
         """Update the status line, and optionally the detail line, from any thread."""
         def apply():
+            """The widget writes, run on the main thread by `_pump`."""
             self.status.configure(text=text)
             if detail is not None:
                 self.detail.configure(text=detail)
@@ -526,6 +539,7 @@ class Launcher(object):
         silently is indistinguishable from one still working.
         """
         def apply():
+            """The widget writes, run on the main thread by `_pump`."""
             self.bar.stop()
             self.bar.pack_forget()
             self.finished = True
@@ -538,6 +552,7 @@ class Launcher(object):
 
     # -- actions ------------------------------------------------------------
     def open_browser(self):
+        """Open the dashboard in the default browser. A no-op before the URL exists."""
         if self.url:
             webbrowser.open(self.url)
 
@@ -583,6 +598,13 @@ class Launcher(object):
 
     # -- the boot sequence, on a worker thread ------------------------------
     def boot(self):
+        """Start the boot sequence on a daemon thread and return immediately.
+
+        Daemon so a closed window is never held open by it, which is why
+        `main()` has to join the thread after `mainloop()` returns: otherwise
+        the interpreter exits and kills it wherever it stands, possibly one
+        statement past `Popen`.
+        """
         self.thread = threading.Thread(target=self._boot, daemon=True)
         self.thread.start()
 
