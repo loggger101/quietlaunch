@@ -144,6 +144,15 @@ def _port_is_free(port):
 
 
 def _port_answers(port, timeout=0.4):
+    """True if something is LISTENING on this localhost port.
+
+    The other half of `_port_is_free`, and the two are deliberately separate
+    questions asked in that order. `_port_is_free` does a bare `bind` and must
+    NOT set SO_REUSEADDR: on Windows that flag is inverted, meaning "bind even
+    though someone else holds it" rather than Unix's "reuse a TIME_WAIT port",
+    so setting it made a free-port probe answer True for the very port
+    Streamlit was serving on at that moment.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         return s.connect_ex(("127.0.0.1", port)) == 0
@@ -168,6 +177,14 @@ def _is_streamlit_server(port):
 
 
 def _write_marker(port, pid):
+    """Record the port and pid of the server WE started, under .launcher/.
+
+    `_is_streamlit_server` can tell you a Streamlit is on the port; only this
+    can tell you it is ours. Reuse needs the marker, a live pid AND a healthy
+    port, so a crashed launcher, a recycled pid and a stranger's app each fail a
+    different one of the three. Failing to write it is not fatal: a launcher
+    that cannot leave a note still runs the dashboard.
+    """
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(MARKER, "w", encoding="utf-8") as f:
@@ -177,6 +194,12 @@ def _write_marker(port, pid):
 
 
 def _read_marker():
+    """(port, pid) from the marker file, or (None, None) if it is absent or bad.
+
+    Deliberately swallows everything: the marker is a hint left by a previous
+    process, so a truncated or hand-edited one means "no usable server", never
+    an error the user has to deal with.
+    """
     try:
         with open(MARKER, encoding="utf-8") as f:
             d = json.load(f)
@@ -186,6 +209,7 @@ def _read_marker():
 
 
 def _clear_marker():
+    """Delete the marker once the server it names is gone. A missing file is fine."""
     try:
         os.remove(MARKER)
     except OSError:
@@ -193,6 +217,15 @@ def _clear_marker():
 
 
 def _pid_alive(pid):
+    """True if the process still exists, without signalling it.
+
+    POSIX gets `kill(pid, 0)`. Windows has no such call, so this opens the
+    process with QUERY_LIMITED_INFORMATION and reads its exit code:
+    STILL_ACTIVE (259) means alive. That constant is genuinely ambiguous in
+    Win32, since a process may exit WITH code 259, but nothing here exits with
+    a code at all, and the alternative, a full snapshot walk, costs far more
+    for the same answer.
+    """
     if os.name != "nt":
         try:
             os.kill(pid, 0)
@@ -245,6 +278,12 @@ def _choose_port():
 # --------------------------------------------------------------------------
 
 def _tail(path, lines=14):
+    """Last few lines of a log file for the failure message, or "" if unreadable.
+
+    Under `pythonw` there is no console, so this text IS the error report; a
+    boot failure that could not say why is the whole reason the launcher grew a
+    window rather than merely hiding the console.
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             got = f.read().splitlines()
@@ -334,6 +373,12 @@ def _streamlit_installed():
 
 
 def _pip_install_streamlit():
+    """One-time `pip install` of the UI requirements. True if it succeeded.
+
+    Runs through `_console_python()` rather than `sys.executable`, because under
+    `pythonw` the latter is the windowless interpreter; output goes to
+    `.launcher/install.log`, which `_tail` reads back if this fails.
+    """
     os.makedirs(LOG_DIR, exist_ok=True)
     req = os.path.join(HERE, "requirements-ui.txt")
     args = ["-r", req] if os.path.isfile(req) else ["streamlit>=1.30"]
@@ -427,6 +472,7 @@ class Launcher(object):
     # this is the only channel between the two.
 
     def _post(self, fn):
+        """Queue a callable for the MAIN thread. The only worker-to-UI channel."""
         self.work.put(fn)
 
     def _pump_once(self):
@@ -442,6 +488,13 @@ class Launcher(object):
                 pass
 
     def _pump(self):
+        """Drain the queue on the main thread, then reschedule itself.
+
+        `_pump_once` is the same drain without the reschedule, for teardown. An
+        exception from a queued callable is swallowed on purpose: a widget
+        destroyed between post and run must not stop the pump, which is the only
+        way anything reaches the window.
+        """
         while True:
             try:
                 fn = self.work.get_nowait()
@@ -458,6 +511,7 @@ class Launcher(object):
                 pass
 
     def _say(self, text, detail=None):
+        """Update the status line, and optionally the detail line, from any thread."""
         def apply():
             self.status.configure(text=text)
             if detail is not None:
@@ -465,6 +519,12 @@ class Launcher(object):
         self._post(apply)
 
     def _done_booting(self, ok, message, detail=""):
+        """End the boot sequence: stop the progress bar and report pass or fail.
+
+        Enables "Open in browser" only on success. Called exactly once per boot,
+        including from `_boot`'s except arm, because a launcher that dies
+        silently is indistinguishable from one still working.
+        """
         def apply():
             self.bar.stop()
             self.bar.pack_forget()
@@ -482,6 +542,16 @@ class Launcher(object):
             webbrowser.open(self.url)
 
     def quit(self):
+        """Stop the server and tear the window down. Safe to call twice.
+
+        Two things here are not optional. The lock makes the read of
+        `(proc, logfile)` atomic against the hand-over in `_boot_inner`, because
+        closing the window mid-spawn otherwise found `proc` still None, killed
+        nothing, and left a server that nothing on screen could stop. And the
+        pending `after` is CANCELLED rather than merely left unscheduled:
+        clearing `stopping` stops the pump rescheduling, but the one already in
+        flight still fires, into a destroyed interpreter.
+        """
         with self.lock:
             if self.stopping:
                 return
@@ -546,6 +616,12 @@ class Launcher(object):
                 pass
 
     def _boot(self):
+        """Worker-thread entry point: run the boot sequence, report any exception.
+
+        The bare `except` is the point. This runs on a daemon thread under
+        `pythonw`, where an unhandled traceback goes nowhere at all, so every
+        failure has to come back through `_done_booting` and onto the window.
+        """
         try:
             self._boot_inner()
         except Exception as exc:                       # never die silently
@@ -557,6 +633,15 @@ class Launcher(object):
                 pass          # reporting a failure must not raise a second one
 
     def _boot_inner(self):
+        """Install if needed, pick a port, adopt or spawn a server, wait for health.
+
+        Checks `self.stopping` between every slow step, because the window can be
+        closed at any point during the seconds this takes and everything past
+        that point is work nobody is waiting for. If it finds OUR server already
+        running it reopens the browser and quits rather than supervising nothing:
+        a second control window whose Stop button stops nothing, beside one that
+        works, is worse than no window.
+        """
         if not os.path.isfile(APP):
             self._done_booting(False, "ui.py is not next to this launcher.",
                                "Looked in: %s" % HERE)
@@ -647,6 +732,18 @@ class Launcher(object):
 
 
 def main():
+    """Put up the control window, boot the dashboard, and own the stop button.
+
+    The tkinter import is the one thing allowed to fail into a lesser mode: with
+    no tkinter there is no window, so this starts the server, opens the browser
+    and says in a message box that stopping it means Task Manager.
+
+    `app.finish()` runs AFTER `mainloop()` returns, and joining the boot thread
+    there is required rather than tidy: the thread is a daemon, so without the
+    join the interpreter exits and kills it wherever it stands, and the lock in
+    `quit()` would be guarding a hand-over the process never lives long enough
+    to reach.
+    """
     try:
         import tkinter as tk
         from tkinter import ttk
