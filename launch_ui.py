@@ -47,10 +47,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(HERE, "ui.py")
 LOG_DIR = os.path.join(HERE, ".launcher")
 
-# Per PORT, not one shared file: two launchers on different ports would both
-# truncate a single dashboard.log, and the surviving copy would be the wrong
-# one exactly when somebody is trying to read it to find out why the other
-# failed.
+
 def _log_path(port):
     """Where the server's stdout goes, named by PORT.
 
@@ -71,7 +68,7 @@ PORT_FIRST = 8501
 PORT_TRIES = 12
 
 # Cold start imports master.py, which is ~1 MB and pulls pandas, numpy and
-# yfinance behind it. On a Drive File Stream working copy that read is slow and
+# yfinance behind it. On a synced-folder working copy that read is slow and
 # serialises, so this is minutes rather than seconds the first time.
 BOOT_TIMEOUT_S = 300.0
 
@@ -507,15 +504,7 @@ class Launcher(object):
         destroyed between post and run must not stop the pump, which is the only
         way anything reaches the window.
         """
-        while True:
-            try:
-                fn = self.work.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                fn()
-            except Exception:
-                pass                      # a dead widget must not stop the pump
+        self._pump_once()
         if not self.stopping:
             try:
                 self.pump_id = self.root.after(POLL_MS, self._pump)
@@ -772,18 +761,39 @@ def main():
     except Exception:
         # No tkinter: fall back to a plain start with a message box, which is
         # worse (nothing to close) but better than doing nothing at all.
+        #
+        # It reports what happened rather than what was hoped for: until
+        # 2026-10-18 it opened the browser and said "The dashboard is at ..."
+        # whether the server had answered, died at import, or timed out --
+        # under pythonw, the one message anybody would see, and it was wrong
+        # exactly when it mattered.
         port, running = _choose_port()
         url = "http://localhost:%d" % port
         if not running:
             proc, logfile = _start_streamlit(port)
+            up = False
             for _ in range(int(BOOT_TIMEOUT_S * 4)):
                 if _port_answers(port):
                     _write_marker(port, proc.pid)
+                    up = True
                     break
                 if proc.poll() is not None:
                     break
                 time.sleep(0.25)
             logfile.close()
+            if not up:
+                died = proc.poll() is not None
+                if not died:
+                    _stop(proc)
+                _message_box(
+                    "Asteroid Pipeline",
+                    ("The server stopped while starting up."
+                     if died else
+                     "The server did not come up within %d seconds."
+                     % int(BOOT_TIMEOUT_S))
+                    + "\n\n" + (_tail(_log_path(port))
+                                 or "See " + os.path.relpath(_log_path(port), HERE)))
+                return 1
         webbrowser.open(url)
         _message_box("Asteroid Pipeline",
                      "The dashboard is at %s\n\n"
