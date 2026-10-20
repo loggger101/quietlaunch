@@ -1,5 +1,7 @@
 # quietlaunch
 
+[![tests](https://github.com/loggger101/quietlaunch/actions/workflows/tests.yml/badge.svg)](https://github.com/loggger101/quietlaunch/actions/workflows/tests.yml)
+
 Start a Streamlit app with **no console window**, and give it something to close.
 
 `streamlit run app.py` in a terminal makes the terminal the app: close it and the
@@ -16,8 +18,9 @@ console with a small control window that
 - stops the server **and its children** when it is closed;
 - installs Streamlit on first use if the interpreter does not have it.
 
-Standard library only. Windows is the reason it exists; Linux and macOS work too
-(tkinter required for the window; without it there is a message-box fallback).
+Python 3.9 or later, standard library only. Windows is the reason it exists;
+Linux and macOS work too, and CI runs all three (tkinter required for the
+window; without it there is a message-box fallback).
 
 Extracted from [economicspace](https://github.com/loggger101/economicspace)'s
 dashboard launcher, whose history this repository carries.
@@ -59,20 +62,21 @@ sys.exit(quietlaunch.launch(quietlaunch.LaunchConfig(
 )))
 ```
 
-`python -m quietlaunch --help` lists every option; each is a `LaunchConfig`
+`python -m quietlaunch --help` lists every option; each sets a `LaunchConfig`
 field:
 
-| field | default | what |
-|---|---|---|
-| `app` | (required) | the Streamlit script |
-| `title`, `heading`, `subtitle` | `Streamlit`, title, `Dashboard` | window text |
-| `boot_hint` | empty | shown while the server boots |
-| `workdir` | the app's folder | the server's working directory |
-| `state_dir` | `<workdir>/.launcher` | logs and the running-server marker; gitignore it |
-| `port_first`, `port_tries` | `8501`, `12` | ports tried, upwards |
-| `boot_timeout_s` | `300` | how long a boot may take |
-| `auto_install`, `requirements` | `True`, none | first-run `pip install` of Streamlit, or of a requirements file |
-| `streamlit_args` | none | extra `streamlit run` arguments |
+| field | flag | default | what |
+|---|---|---|---|
+| `app` | positional | (required) | the Streamlit script |
+| `title`, `heading`, `subtitle` | `--title`, `--heading`, `--subtitle` | `Streamlit`, title, `Dashboard` | window text |
+| `boot_hint` | `--hint` | empty | shown while the server boots |
+| `workdir` | `--workdir` | the app's folder | the server's working directory |
+| `state_dir` | `--state-dir` | `<workdir>/.launcher` | logs and the running-server marker; gitignore it |
+| `port_first`, `port_tries` | `--port`, `--port-tries` | `8501`, `12` | ports tried, upwards |
+| `boot_timeout_s` | `--boot-timeout` | `300` | how long a boot may take |
+| `auto_install` | `--no-install` | `True` | first-run `pip install` when Streamlit is missing |
+| `requirements` | `--requirements` | none | install from this file (relative to `workdir`) instead of `streamlit>=1.30`; a missing file falls back to that spec |
+| `streamlit_args` | after `--` | none | extra `streamlit run` arguments |
 
 What it leaves in `state_dir`: `dashboard-<port>.log` (the server's output),
 `install.log` (the first-run install), and `running-<app>.json` (the port, pid
@@ -123,7 +127,13 @@ python -m pytest
 
 The tests run the real boot sequence against a fake server
 (`tests/fake_streamlit.py`) and stand-in Tk widgets, so they need no display and
-no Streamlit, and finish in seconds.
+no Streamlit, and finish in seconds. `tests/test_rules.py` also holds the
+package to its own rules: standard library only, ASCII only, a docstring on
+every definition.
+
+A release bumps `quietlaunch.__version__` (the one place the version is
+written; `pyproject.toml` reads it), adds a [CHANGELOG](CHANGELOG.md) entry,
+and tags `vX.Y.Z`. Consumers pin the tag.
 
 ## Licence
 
