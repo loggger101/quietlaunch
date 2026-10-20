@@ -242,11 +242,10 @@ def _port_answers(port, timeout=0.4):
     """True if something is LISTENING on this localhost port.
 
     The other half of `_port_is_free`, and the two are deliberately separate
-    questions asked in that order. `_port_is_free` does a bare `bind` and must
-    NOT set SO_REUSEADDR: on Windows that flag is inverted, meaning "bind even
-    though someone else holds it" rather than Unix's "reuse a TIME_WAIT port",
-    so setting it made a free-port probe answer True for the very port
-    Streamlit was serving on at that moment.
+    questions, this one asked FIRST. A bind cannot be trusted to detect a live
+    server on Windows: a server listening on 0.0.0.0 does not stop a plain bind
+    on 127.0.0.1, so only a connect says whether anybody is there. See
+    `_port_is_free` for why that probe must not set SO_REUSEADDR either.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
@@ -663,7 +662,7 @@ class Launcher(object):
     def _done_booting(self, ok, message, detail=""):
         """End the boot sequence: stop the progress bar and report pass or fail.
 
-        Enables "Open in browser" only on success. Called exactly once per boot,
+        Enables "Open dashboard" only on success. Called exactly once per boot,
         including from `_boot`'s except arm, because a launcher that dies
         silently is indistinguishable from one still working.
         """
@@ -693,7 +692,7 @@ class Launcher(object):
         closing the window mid-spawn otherwise found `proc` still None, killed
         nothing, and left a server that nothing on screen could stop. And the
         pending `after` is CANCELLED rather than merely left unscheduled:
-        clearing `stopping` stops the pump rescheduling, but the one already in
+        setting `stopping` stops the pump rescheduling, but the one already in
         flight still fires, into a destroyed interpreter.
         """
         with self.lock:
