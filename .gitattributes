@@ -1,0 +1,12 @@
+# LF everywhere. core.autocrlf is true in Git for Windows' system config, and a
+# CRLF workflow file reaches the Linux runner's shell as a trailing carriage
+# return on every command.
+*.py    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.txt   text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+LICENSE        text eol=lf

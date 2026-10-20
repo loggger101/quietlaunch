@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# What the launcher itself writes beside an app it was pointed at here.
+.launcher/
+
+# Local tooling / editor
+.claude/
+.vscode/
+.idea/
+desktop.ini
+Thumbs.db
+.DS_Store
