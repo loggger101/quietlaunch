@@ -2,6 +2,7 @@
 """A stand-in for `streamlit run`, so the boot sequence can be tested in seconds.
 
     python fake_streamlit.py PORT serve   answer /_stcore/health with `ok`
+    python fake_streamlit.py PORT slow    the same, 3 s late, like a busy app
     python fake_streamlit.py PORT parent  a child serves; this one only waits
     python fake_streamlit.py PORT die     print a traceback-shaped line, exit 3
     python fake_streamlit.py PORT hang    never listen, never exit
@@ -15,9 +16,13 @@ import time
 class _Health(http.server.BaseHTTPRequestHandler):
     """Streamlit's health endpoint and nothing else."""
 
+    # Seconds the health answer takes: a server whose app is busy (`slow`).
+    delay = 0.0
+
     def do_GET(self):
         """`ok` on the health path, 404 anywhere else."""
         if self.path == "/_stcore/health":
+            time.sleep(self.delay)
             body = b"ok"
             self.send_response(200)
         else:
@@ -34,7 +39,9 @@ class _Health(http.server.BaseHTTPRequestHandler):
 def main():
     """Run in the mode named on the command line."""
     port, mode = int(sys.argv[1]), sys.argv[2]
-    if mode == "serve":
+    if mode in ("serve", "slow"):
+        if mode == "slow":
+            _Health.delay = 3.0
         print("fake streamlit serving on %d" % port, flush=True)
         http.server.HTTPServer(("127.0.0.1", port), _Health).serve_forever()
     elif mode == "parent":

@@ -134,6 +134,17 @@ def test_our_live_server_is_reused(cfg, serve_other):
     assert launcher._choose_port(cfg) == (cfg.port_first, True)
 
 
+def test_our_busy_server_is_still_reused(cfg, serve_other):
+    """A dashboard whose app is mid-run answers health late, but answers.
+
+    economicspace's took 4.4 s during a page load; at a 1 s timeout a second
+    double-click booted a second server instead of reopening the first.
+    """
+    p = serve_other(cfg.port_first, mode="slow")
+    launcher._write_marker(cfg, cfg.port_first, p.pid)
+    assert launcher._choose_port(cfg) == (cfg.port_first, True)
+
+
 def test_a_dead_pids_marker_is_not_adopted_although_the_port_answers(
         cfg, serve_other):
     """A crash leaves a note; a stranger later takes the port. Not ours."""

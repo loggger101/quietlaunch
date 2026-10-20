@@ -92,6 +92,10 @@ plant every one and fail on it.
   the marker, a live pid **and** a healthy port: a crashed launcher, a recycled
   pid and a stranger's app each fail a different one. The marker is per app, so
   two apps in one folder do not adopt, or delete the note of, each other's server.
+- **A busy dashboard answers its health check late.** The app's script runs in
+  the server's process; during a page load `/_stcore/health` took 4.4 s on the
+  dashboard this came from. A 1 s check read our own server as a stranger and
+  booted a second one, so reuse waits up to 15 s (`REUSE_HEALTH_TIMEOUT_S`).
 - **`Tk.after` is not thread-safe**, and raises once the main loop is gone. The
   boot thread never touches a widget; it posts callables to a queue the main
   thread drains, and `quit()` cancels the pending drain rather than letting it

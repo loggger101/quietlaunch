@@ -21,6 +21,11 @@ What changed in moving it:
   and the group is killed. Before, only Windows killed children (`taskkill /T`);
   POSIX terminated the one pid, never noticed because the launcher had only run
   on Windows.
+- **A busy dashboard is reused, not duplicated.** The reuse health check
+  waited 1 s; economicspace's dashboard took 4.4 s to answer during a page
+  load, so a second double-click then booted a second server on the next port
+  (found verifying this release; the same in launch_ui.py). It waits up to
+  15 s once the marker and a live pid agree.
 - **A failed install shows pip's last lines**, not only the log's path, and a
   missing app or Streamlit is named in the window.
 - **Usage errors under `pythonw` raise a message box**, as argparse's stderr is

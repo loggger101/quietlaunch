@@ -61,6 +61,16 @@ PORT_TRIES = 12
 # failure that is not one.
 BOOT_TIMEOUT_S = 300.0
 
+# How long a server our marker names gets to answer its health check before we
+# decide it is not ours. Measured on economicspace's dashboard: `/_stcore/health`
+# took 4.4 s during a page load, because the app's script runs in the server's
+# process and starves its event loop. At the 1.0 s it used to have, a second
+# double-click while the dashboard was busy read it as a stranger and booted a
+# second server on the next port. Long is cheap here: by this point the marker
+# and a live pid already agree, and the case the check guards against (a
+# recycled pid, a non-Streamlit listener) fails fast rather than slowly.
+REUSE_HEALTH_TIMEOUT_S = 15.0
+
 # What the first-run install asks pip for when no requirements file is given.
 # 1.30 is the floor the launcher was built against; `/_stcore/health`, which
 # `_is_streamlit_server` reads, has answered `ok` since 1.19.
@@ -243,7 +253,7 @@ def _port_answers(port, timeout=0.4):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _is_streamlit_server(port):
+def _is_streamlit_server(port, timeout=1.0):
     """True if something on this port is a live Streamlit server -- ANY of them.
 
     `/_stcore/health` answers `ok` and has since Streamlit 1.19; anything else
@@ -251,11 +261,14 @@ def _is_streamlit_server(port):
     canNOT tell you: whether the app being served is ours. That is the marker
     file's job, and conflating the two is how a double-click would have opened
     somebody else's Streamlit project because it got to 8501 first.
+
+    `timeout` is how long a BUSY server gets to answer; see
+    REUSE_HEALTH_TIMEOUT_S for why reuse asks with a long one.
     """
     import urllib.request
     try:
         url = "http://127.0.0.1:%d/_stcore/health" % port
-        with urllib.request.urlopen(url, timeout=1.0) as r:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
             return r.read(32).strip().lower() == b"ok"
     except Exception:
         return False
@@ -347,7 +360,7 @@ def _choose_port(cfg):
     """
     port, pid = _read_marker(cfg)
     if (port and pid and _pid_alive(pid) and _port_answers(port)
-            and _is_streamlit_server(port)):
+            and _is_streamlit_server(port, REUSE_HEALTH_TIMEOUT_S)):
         return port, True                   # our own dashboard, still up
 
     # All three conditions matter. The pid check rejects a marker left behind
@@ -805,6 +818,9 @@ class Launcher(object):
         if self.stopping:
             return                  # closed during the install; spawn nothing
 
+        # Seconds, not milliseconds, when a dashboard is already up but busy;
+        # say so rather than sit on "Starting...".
+        self._say("Looking for a dashboard that is already running...")
         self.port, running = _choose_port(cfg)
         self.url = "http://localhost:%d" % self.port
         if self.stopping:

@@ -64,9 +64,9 @@ def serve_other(tmp_path):
     """Start a fake Streamlit this launcher did NOT start; yields its port."""
     procs = []
 
-    def start(port):
+    def start(port, mode="serve"):
         """Spawn a stranger's server on `port` and wait until it answers."""
-        p = subprocess.Popen([sys.executable, FAKE, str(port), "serve"],
+        p = subprocess.Popen([sys.executable, FAKE, str(port), mode],
                              stdout=subprocess.DEVNULL)
         procs.append(p)
         wait_for(lambda: launcher._port_answers(port))
