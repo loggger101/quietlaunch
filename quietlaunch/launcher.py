@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Start the dashboard with no terminal window, and give it something to close.
+"""Start a Streamlit app with no terminal window, and give it something to close.
 
-    pyw -3 launch_ui.py          (what `_START HERE.vbs` runs)
-    py  -3 launch_ui.py          (same thing, with a console to watch)
+    pythonw -m quietlaunch app.py --title "My dashboard"
+    python  -m quietlaunch app.py           (same thing, with a console to watch)
 
-WHY THIS EXISTS. `run.bat ui` USED TO run `streamlit run ui.py` in the
-foreground, so the console window WAS the app: closing it stopped the server,
-and it had to stay open and in the way for as long as the dashboard was up.
-That is the terminal this file removes. `run.bat ui` now hands off to
-`_START HERE.vbs`, which runs this, and falls back to the foreground server
-only when that file is missing.
+or from a project's own launcher script:
+
+    import quietlaunch
+    sys.exit(quietlaunch.launch(quietlaunch.LaunchConfig(app="ui.py")))
+
+WHY THIS EXISTS. `streamlit run app.py` in a console makes the console window
+the app: closing it stops the server, and it has to stay open and in the way
+for as long as the dashboard is up. That is the terminal this removes.
 
 Removing it costs more than hiding it, which is the whole design here. A
 `pythonw` process with no console has no window to close and no output to read,
@@ -19,20 +21,24 @@ a small control window instead: it says what is happening while Streamlit boots,
 opens the browser once the port actually answers, and stops the server when it
 is closed. The window replaces the console rather than merely suppressing it.
 
-NOT A SECOND ENTRY POINT TO THE MODEL. It never imports master, ui, or anything
-under modules/ -- it spawns `streamlit run ui.py` as a child and watches a
-socket. That is deliberate: this process is the one thing that must not fail,
-and importing the pipeline here would put a 1 MB module and a multiprocessing
-pool inside the supervisor. It also sidesteps `_spawn_environment` entirely,
-since nothing here is ever a worker's `__main__`.
+IT NEVER IMPORTS THE APP. It spawns `streamlit run <app>` as a child and
+watches a socket. That is deliberate: this process is the one thing that must
+not fail, and importing the app here would put whatever the app imports (often
+a large model and a multiprocessing pool) inside the supervisor, and could make
+this process a worker's `__main__`. Standard library only, for the same reason.
 
-ASCII ONLY, like the rest of the pipeline's output. Nothing here is printed to
-a redirected stdout, but the rule is cheap to keep and the log file this writes
-is read by the same eyes.
+ASCII ONLY. Nothing here is printed to a redirected stdout, but Windows picks
+cp1252 for one, the rule is cheap to keep, and the log file this writes is read
+by the same eyes.
+
+Extracted from economicspace's `launch_ui.py`, whose history this repository
+carries; each Windows trap noted below was hit there first.
 """
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
 import json
 import os
 import queue
@@ -42,35 +48,111 @@ import sys
 import threading
 import time
 import webbrowser
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-APP = os.path.join(HERE, "ui.py")
-LOG_DIR = os.path.join(HERE, ".launcher")
-
-
-def _log_path(port):
-    """Where the server's stdout goes, named by PORT.
-
-    Per port rather than one shared file: two launchers would both truncate a
-    single dashboard.log, and the surviving copy would be the wrong one exactly
-    when somebody is reading it to find out why the other failed.
-    """
-    return os.path.join(LOG_DIR, "dashboard-%d.log" % port)
-
-
-# Names the server THIS launcher started, so a later launch can tell our
-# dashboard from any other Streamlit app that happens to hold the port.
-MARKER = os.path.join(LOG_DIR, "running.json")
+from typing import Optional, Tuple
 
 # Streamlit's default, then upwards. A second launch lands on the next free one
 # rather than fighting the first.
 PORT_FIRST = 8501
 PORT_TRIES = 12
 
-# Cold start imports master.py, which is ~1 MB and pulls pandas, numpy and
-# yfinance behind it. On a synced-folder working copy that read is slow and
-# serialises, so this is minutes rather than seconds the first time.
+# A cold start is the app's own import time, which for a data app on a
+# synced-folder working copy can be minutes rather than seconds the first time.
+# Generous on purpose: a timeout that fires on a slow-but-healthy boot reports a
+# failure that is not one.
 BOOT_TIMEOUT_S = 300.0
+
+# What the first-run install asks pip for when no requirements file is given.
+# 1.30 is the floor the launcher was built against; `/_stcore/health`, which
+# `_is_streamlit_server` reads, has answered `ok` since 1.19.
+STREAMLIT_SPEC = "streamlit>=1.30"
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchConfig:
+    """Everything that differs between one project's launcher and another's.
+
+    Frozen and built once: every path below is derived from `app` unless given,
+    so a caller names the script and nothing else and gets a launcher whose
+    state lives beside it.
+    """
+
+    # The Streamlit script to run. Resolved to an absolute path; the server's
+    # working directory is its folder unless `workdir` says otherwise.
+    app: str
+    # Window title and message-box caption.
+    title: str = "Streamlit"
+    # The bold line at the top of the control window. Defaults to `title`.
+    heading: Optional[str] = None
+    # The small line under the heading.
+    subtitle: str = "Dashboard"
+    # Shown under the status line while the server boots; a good place to say
+    # how long a cold start takes, since the launcher cannot know.
+    boot_hint: str = ""
+    # The server's working directory. Defaults to the app's folder.
+    workdir: Optional[str] = None
+    # Where the logs and the running-server marker go. Defaults to
+    # `<workdir>/.launcher`; keep it out of version control.
+    state_dir: Optional[str] = None
+    # Ports tried, from `port_first` upwards.
+    port_first: int = PORT_FIRST
+    port_tries: int = PORT_TRIES
+    # How long a boot may take before it is reported as failed.
+    boot_timeout_s: float = BOOT_TIMEOUT_S
+    # Install Streamlit on first use if it is not importable.
+    auto_install: bool = True
+    # A requirements file for that install, instead of `STREAMLIT_SPEC`. A
+    # relative path is taken against `workdir`; a missing file falls back to
+    # the spec rather than failing, as a requirements file is a convenience.
+    requirements: Optional[str] = None
+    # Extra arguments for `streamlit run`, after the launcher's own.
+    streamlit_args: Tuple[str, ...] = ()
+
+    def __post_init__(self):
+        """Absolutise the paths once, so a later chdir cannot move them."""
+        app = os.path.abspath(self.app)
+        workdir = os.path.abspath(self.workdir or os.path.dirname(app))
+        object.__setattr__(self, "app", app)
+        object.__setattr__(self, "workdir", workdir)
+        object.__setattr__(self, "state_dir", os.path.abspath(
+            self.state_dir or os.path.join(workdir, ".launcher")))
+        if self.requirements:
+            object.__setattr__(self, "requirements", os.path.join(
+                workdir, self.requirements))
+        object.__setattr__(self, "streamlit_args", tuple(self.streamlit_args))
+
+    @property
+    def window_heading(self):
+        """The heading line, falling back to the title."""
+        return self.heading or self.title
+
+    @property
+    def marker(self):
+        """Names the server THIS launcher started, per app.
+
+        So a later launch can tell our dashboard from any other Streamlit app
+        that happens to hold the port. Keyed by the app's file name because two
+        apps in one folder share a `state_dir`, and one shared marker would let
+        each adopt, or clear the note of, the other's server.
+        """
+        stem = os.path.splitext(os.path.basename(self.app))[0]
+        return os.path.join(self.state_dir, "running-%s.json" % stem)
+
+    def log_path(self, port):
+        """Where the server's stdout goes, named by PORT.
+
+        Per port rather than one shared file: two launchers would both truncate
+        a single dashboard.log, and the surviving copy would be the wrong one
+        exactly when somebody is reading it to find out why the other failed.
+        """
+        return os.path.join(self.state_dir, "dashboard-%d.log" % port)
+
+    def rel(self, path):
+        """`path` relative to the working directory, for messages."""
+        try:
+            return os.path.relpath(path, self.workdir)
+        except ValueError:                  # another drive on Windows
+            return path
+
 
 # How long main() waits for the boot thread to stand down before exiting. Only
 # ever reached when the window is closed mid-boot; see Launcher.finish.
@@ -179,8 +261,8 @@ def _is_streamlit_server(port):
         return False
 
 
-def _write_marker(port, pid):
-    """Record the port and pid of the server WE started, under .launcher/.
+def _write_marker(cfg, port, pid):
+    """Record the port, pid and app of the server WE started, under state_dir.
 
     `_is_streamlit_server` can tell you a Streamlit is on the port; only this
     can tell you it is ours. Reuse needs the marker, a live pid AND a healthy
@@ -189,32 +271,37 @@ def _write_marker(port, pid):
     that cannot leave a note still runs the dashboard.
     """
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        with open(MARKER, "w", encoding="utf-8") as f:
-            json.dump({"port": port, "pid": pid, "started": time.time()}, f)
+        os.makedirs(cfg.state_dir, exist_ok=True)
+        with open(cfg.marker, "w", encoding="utf-8") as f:
+            json.dump({"port": port, "pid": pid, "app": cfg.app,
+                       "started": time.time()}, f)
     except (OSError, TypeError, ValueError):
         pass                       # a launcher that cannot write a note still works
 
 
-def _read_marker():
+def _read_marker(cfg):
     """(port, pid) from the marker file, or (None, None) if it is absent or bad.
 
     Deliberately swallows everything: the marker is a hint left by a previous
     process, so a truncated or hand-edited one means "no usable server", never
-    an error the user has to deal with.
+    an error the user has to deal with. A marker naming a different app is
+    "no usable server" too: same file name, another folder's script, when two
+    projects were pointed at one `state_dir`.
     """
     try:
-        with open(MARKER, encoding="utf-8") as f:
+        with open(cfg.marker, encoding="utf-8") as f:
             d = json.load(f)
+        if os.path.normcase(d["app"]) != os.path.normcase(cfg.app):
+            return None, None
         return int(d["port"]), int(d["pid"])
     except Exception:
         return None, None
 
 
-def _clear_marker():
+def _clear_marker(cfg):
     """Delete the marker once the server it names is gone. A missing file is fine."""
     try:
-        os.remove(MARKER)
+        os.remove(cfg.marker)
     except OSError:
         pass
 
@@ -249,7 +336,7 @@ def _pid_alive(pid):
         k32.CloseHandle(h)
 
 
-def _choose_port():
+def _choose_port(cfg):
     """(port, already_running). Reuses a dashboard that is already up.
 
     Listening is tested before bindability, not after: "is something there" is
@@ -258,7 +345,7 @@ def _choose_port():
     semantics to detect a live server, which is what the SO_REUSEADDR note
     above is about.
     """
-    port, pid = _read_marker()
+    port, pid = _read_marker(cfg)
     if (port and pid and _pid_alive(pid) and _port_answers(port)
             and _is_streamlit_server(port)):
         return port, True                   # our own dashboard, still up
@@ -266,14 +353,16 @@ def _choose_port():
     # All three conditions matter. The pid check rejects a marker left behind
     # by a crash; the health check rejects a pid that Windows has recycled onto
     # some unrelated process; and reaching here at all means we will not adopt
-    # a Streamlit server we did not start.
-    _clear_marker()
-    for port in range(PORT_FIRST, PORT_FIRST + PORT_TRIES):
+    # a Streamlit server we did not start. Only a marker that names THIS app is
+    # cleared: one naming another app is that app's note, not ours to delete.
+    if port is not None:
+        _clear_marker(cfg)
+    for port in range(cfg.port_first, cfg.port_first + cfg.port_tries):
         if _port_answers(port):
             continue                        # somebody is there; do not disturb
         if _port_is_free(port):
             return port, False
-    return PORT_FIRST, False
+    return cfg.port_first, False
 
 
 # --------------------------------------------------------------------------
@@ -295,12 +384,10 @@ def _tail(path, lines=14):
     return "\n".join(got[-lines:]).strip()
 
 
-def _start_streamlit(port):
-    """Spawn the server. Returns (Popen, logfile_handle)."""
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log = open(_log_path(port), "w", encoding="utf-8", errors="replace")
-    cmd = [
-        _console_python(), "-m", "streamlit", "run", APP,
+def _server_command(cfg, port):
+    """The argv that starts the server. Its own function so tests can stand in."""
+    return [
+        _console_python(), "-m", "streamlit", "run", cfg.app,
         # headless keeps Streamlit from opening its own browser -- this file
         # opens it once the port actually answers, which is a different moment
         # -- and suppresses the first-run email prompt, which would otherwise
@@ -308,15 +395,26 @@ def _start_streamlit(port):
         "--server.headless=true",
         "--server.port=%d" % port,
         "--browser.gatherUsageStats=false",
-    ]
+    ] + list(cfg.streamlit_args)
+
+
+def _start_streamlit(cfg, port):
+    """Spawn the server. Returns (Popen, logfile_handle)."""
+    os.makedirs(cfg.state_dir, exist_ok=True)
+    log = open(cfg.log_path(port), "w", encoding="utf-8", errors="replace")
     env = dict(os.environ)
-    # Same belt and braces as run.bat: the pipeline's own output is ASCII, but
-    # tqdm, tracebacks and data values reach this log too.
+    # The log is read back as UTF-8, and tqdm, tracebacks and data values reach
+    # it even when an app's own output is ASCII; under Windows' cp1252 default
+    # the first such character would kill the server mid-boot.
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     proc = subprocess.Popen(
-        cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, env=env, creationflags=_NO_WINDOW,
+        _server_command(cfg, port), cwd=cfg.workdir, stdout=log,
+        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+        creationflags=_NO_WINDOW,
+        # POSIX: its own session, so `_stop` can kill the process GROUP. The
+        # Windows half of the same job is taskkill's /T.
+        start_new_session=(os.name != "nt"),
     )
     return proc, log
 
@@ -324,7 +422,7 @@ def _start_streamlit(port):
 def _stop(proc):
     """Kill the server AND its children.
 
-    Streamlit's file watcher and the pipeline's own worker pool are separate
+    Streamlit's file watcher and any worker pool the app starts are separate
     processes. Terminating only the one we spawned orphans them, and an orphaned
     worker holds the port -- so the next launch finds 8501 busy and not
     answering health, picks 8502, and the stale one lingers until reboot.
@@ -340,6 +438,24 @@ def _stop(proc):
             )
             return
         except Exception:
+            pass
+    else:
+        # The child leads its own session (`_start_streamlit`), so its pid is
+        # its group's id. In economicspace's launch_ui.py this branch
+        # terminated the one pid and orphaned the rest, unseen because that
+        # launcher only ever ran on Windows.
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                return
+            except OSError:
+                pass
+        except OSError:
             pass
     try:
         proc.terminate()
@@ -375,21 +491,31 @@ def _streamlit_installed():
         return False
 
 
-def _pip_install_streamlit():
+def _install_args(cfg):
+    """What follows `pip install`: the requirements file if there is one."""
+    if cfg.requirements and os.path.isfile(cfg.requirements):
+        return ["-r", cfg.requirements]
+    return [STREAMLIT_SPEC]
+
+
+def _install_log(cfg):
+    """Where the first-run install writes, and where a failure points."""
+    return os.path.join(cfg.state_dir, "install.log")
+
+
+def _pip_install_streamlit(cfg):
     """One-time `pip install` of the UI requirements. True if it succeeded.
 
     Runs through `_console_python()` rather than `sys.executable`, because under
     `pythonw` the latter is the windowless interpreter; output goes to
-    `.launcher/install.log`, which `_tail` reads back if this fails.
+    `install.log` under state_dir, which `_tail` reads back if this fails.
     """
-    os.makedirs(LOG_DIR, exist_ok=True)
-    req = os.path.join(HERE, "requirements-ui.txt")
-    args = ["-r", req] if os.path.isfile(req) else ["streamlit>=1.30"]
-    with open(os.path.join(LOG_DIR, "install.log"), "w",
-              encoding="utf-8", errors="replace") as log:
+    os.makedirs(cfg.state_dir, exist_ok=True)
+    with open(_install_log(cfg), "w", encoding="utf-8",
+              errors="replace") as log:
         rc = subprocess.run(
-            [_console_python(), "-m", "pip", "install"] + args,
-            cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
+            [_console_python(), "-m", "pip", "install"] + _install_args(cfg),
+            cwd=cfg.workdir, stdout=log, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW,
         ).returncode
     return rc == 0
@@ -408,13 +534,14 @@ class Launcher(object):
     not thread-safe, so the worker never touches a widget directly.
     """
 
-    def __init__(self, root, tk, ttk):
+    def __init__(self, cfg, root, tk, ttk):
         """Build the window and the worker-to-UI queue. Nothing slow yet.
 
         `tk` and `ttk` are passed in rather than imported at module scope,
-        because `main()` has to be able to fall back when tkinter is missing,
+        because `launch()` has to be able to fall back when tkinter is missing,
         and an import at the top would take the whole launcher down with it.
         """
+        self.cfg = cfg
         self.tk, self.ttk = tk, ttk
         self.root = root
         self.work = queue.Queue()
@@ -433,7 +560,7 @@ class Launcher(object):
         self.stopping = False
         self.pump_id = None
 
-        root.title("Asteroid Pipeline")
+        root.title(cfg.title)
         root.geometry("470x230")
         root.minsize(470, 230)
         root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -441,9 +568,9 @@ class Launcher(object):
         frame = ttk.Frame(root, padding=18)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="Asteroid mining profitability pipeline",
+        ttk.Label(frame, text=cfg.window_heading,
                   font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="Dashboard",
+        ttk.Label(frame, text=cfg.subtitle,
                   font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 12))
 
         self.status = ttk.Label(frame, text="Starting...", font=("Segoe UI", 9),
@@ -577,7 +704,7 @@ class Launcher(object):
         self.root.update_idletasks()
         _stop(proc)
         if proc is not None:
-            _clear_marker()
+            _clear_marker(self.cfg)
         if logfile is not None:
             try:
                 logfile.close()
@@ -619,7 +746,7 @@ class Launcher(object):
             self.proc, self.logfile = None, None
         if proc is not None:
             _stop(proc)                     # a no-op if quit() already did it
-            _clear_marker()
+            _clear_marker(self.cfg)
         if logfile is not None:
             try:
                 logfile.close()
@@ -653,30 +780,39 @@ class Launcher(object):
         a second control window whose Stop button stops nothing, beside one that
         works, is worse than no window.
         """
-        if not os.path.isfile(APP):
-            self._done_booting(False, "ui.py is not next to this launcher.",
-                               "Looked in: %s" % HERE)
+        cfg = self.cfg
+        if not os.path.isfile(cfg.app):
+            self._done_booting(
+                False, "%s was not found." % os.path.basename(cfg.app),
+                "Looked for: %s" % cfg.app)
             return
 
         if not _streamlit_installed():
+            if not cfg.auto_install:
+                self._done_booting(
+                    False, "Streamlit is not installed.",
+                    "pip install %s" % STREAMLIT_SPEC)
+                return
             self._say("Installing Streamlit (one time, a minute or two)...",
-                      "pip install -r requirements-ui.txt")
-            if not _pip_install_streamlit():
+                      "pip install " + " ".join(
+                          cfg.rel(a) for a in _install_args(cfg)))
+            if not _pip_install_streamlit(cfg):
                 self._done_booting(
                     False, "Could not install Streamlit.",
-                    "See .launcher/install.log")
+                    _tail(_install_log(cfg))
+                    or "See %s" % cfg.rel(_install_log(cfg)))
                 return
         if self.stopping:
             return                  # closed during the install; spawn nothing
 
-        self.port, running = _choose_port()
+        self.port, running = _choose_port(cfg)
         self.url = "http://localhost:%d" % self.port
         if self.stopping:
             return
 
         if running:
             # Someone double-clicked twice, or left it running. Reopening beats
-            # a second copy of a program that loads a 1 MB module.
+            # a second copy of the app and everything it loads.
             #
             # And then this process GOES AWAY. It supervises nothing -- proc is
             # None -- so leaving its window up would put a second "Stop and
@@ -689,7 +825,7 @@ class Launcher(object):
             return
 
         self._say("Starting the server on port %d..." % self.port,
-                  "First run loads the pipeline, which takes a minute.")
+                  cfg.boot_hint)
 
         # THE HAND-OVER, and it has to be atomic against quit().
         #
@@ -700,12 +836,12 @@ class Launcher(object):
         # that could have stopped it now gone. Under the lock, exactly one of
         # the two sides owns the child: if `stopping` is already set we stop
         # what we just started, otherwise quit() is guaranteed to see it.
-        proc, logfile = _start_streamlit(self.port)
+        proc, logfile = _start_streamlit(cfg, self.port)
         with self.lock:
             abandoned = self.stopping
             if not abandoned:
                 self.proc, self.logfile = proc, logfile
-                self.log_path = _log_path(self.port)
+                self.log_path = cfg.log_path(self.port)
         if abandoned:
             _stop(proc)
             try:
@@ -714,8 +850,8 @@ class Launcher(object):
                 pass
             return
 
-        log_note = "See %s" % os.path.relpath(self.log_path, HERE)
-        deadline = time.time() + BOOT_TIMEOUT_S
+        log_note = "See %s" % cfg.rel(self.log_path)
+        deadline = time.time() + cfg.boot_timeout_s
         while time.time() < deadline:
             if self.stopping:
                 return
@@ -730,7 +866,7 @@ class Launcher(object):
                 # survives this launcher being killed, which is what lets the
                 # next double-click adopt an already-running server instead of
                 # starting a second one.
-                _write_marker(self.port, proc.pid)
+                _write_marker(cfg, self.port, proc.pid)
                 self._done_booting(True, "The dashboard is running.", self.url)
                 self._post(self.open_browser)
                 return
@@ -738,12 +874,15 @@ class Launcher(object):
 
         self._done_booting(
             False, "The server did not come up within %d seconds."
-                   % int(BOOT_TIMEOUT_S),
+                   % int(cfg.boot_timeout_s),
             _tail(self.log_path) or log_note)
 
 
-def main():
+def launch(cfg):
     """Put up the control window, boot the dashboard, and own the stop button.
+
+    Returns a process exit code: 0 once the window is closed or the dashboard
+    is up, 1 when the server could not be started without a window to say so.
 
     The tkinter import is the one thing allowed to fail into a lesser mode: with
     no tkinter there is no window, so this starts the server, opens the browser
@@ -767,14 +906,14 @@ def main():
         # whether the server had answered, died at import, or timed out --
         # under pythonw, the one message anybody would see, and it was wrong
         # exactly when it mattered.
-        port, running = _choose_port()
+        port, running = _choose_port(cfg)
         url = "http://localhost:%d" % port
         if not running:
-            proc, logfile = _start_streamlit(port)
+            proc, logfile = _start_streamlit(cfg, port)
             up = False
-            for _ in range(int(BOOT_TIMEOUT_S * 4)):
+            for _ in range(int(cfg.boot_timeout_s * 4)):
                 if _port_answers(port):
-                    _write_marker(port, proc.pid)
+                    _write_marker(cfg, port, proc.pid)
                     up = True
                     break
                 if proc.poll() is not None:
@@ -786,16 +925,16 @@ def main():
                 if not died:
                     _stop(proc)
                 _message_box(
-                    "Asteroid Pipeline",
+                    cfg.title,
                     ("The server stopped while starting up."
                      if died else
                      "The server did not come up within %d seconds."
-                     % int(BOOT_TIMEOUT_S))
-                    + "\n\n" + (_tail(_log_path(port))
-                                 or "See " + os.path.relpath(_log_path(port), HERE)))
+                     % int(cfg.boot_timeout_s))
+                    + "\n\n" + (_tail(cfg.log_path(port))
+                                 or "See " + cfg.rel(cfg.log_path(port))))
                 return 1
         webbrowser.open(url)
-        _message_box("Asteroid Pipeline",
+        _message_box(cfg.title,
                      "The dashboard is at %s\n\n"
                      "tkinter is missing, so there is no control window -- "
                      "stop the server from Task Manager when you are done."
@@ -808,11 +947,71 @@ def main():
         root.deiconify()
     except Exception:
         pass
-    app = Launcher(root, tk, ttk)
+    app = Launcher(cfg, root, tk, ttk)
     app.boot()
     root.mainloop()
     app.finish()
     return 0
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+def _parser():
+    """The `python -m quietlaunch` command line, one flag per LaunchConfig field."""
+    d = LaunchConfig(app="app.py")      # the defaults, read rather than retyped
+    p = argparse.ArgumentParser(
+        prog="quietlaunch",
+        description="Start a Streamlit app with no console window, behind a "
+                    "small control window that stops it.",
+        epilog="Arguments after `--` are passed to `streamlit run`.")
+    p.add_argument("app", help="the Streamlit script to run")
+    p.add_argument("--title", default=d.title,
+                   help="window title and message-box caption")
+    p.add_argument("--heading", help="the window's bold line (default: title)")
+    p.add_argument("--subtitle", default=d.subtitle,
+                   help="the small line under the heading")
+    p.add_argument("--hint", default=d.boot_hint, dest="boot_hint",
+                   help="shown while the server boots")
+    p.add_argument("--workdir", help="server working directory "
+                                     "(default: the app's folder)")
+    p.add_argument("--state-dir", help="logs and marker "
+                                       "(default: <workdir>/.launcher)")
+    p.add_argument("--port", type=int, default=d.port_first, dest="port_first",
+                   help="first port to try (default: %(default)s)")
+    p.add_argument("--port-tries", type=int, default=d.port_tries,
+                   help="how many ports to try (default: %(default)s)")
+    p.add_argument("--boot-timeout", type=float, default=d.boot_timeout_s,
+                   dest="boot_timeout_s",
+                   help="seconds a boot may take (default: %(default)s)")
+    p.add_argument("--requirements",
+                   help="requirements file for the first-run install")
+    p.add_argument("--no-install", action="store_false", dest="auto_install",
+                   help="never pip-install Streamlit")
+    return p
+
+
+def main(argv=None):
+    """CLI entry point: parse `argv` into a LaunchConfig and launch it."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    extra = []
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, extra = argv[:cut], argv[cut + 1:]
+    try:
+        ns = _parser().parse_args(argv)
+    except SystemExit as exc:
+        # Under pythonw argparse's usage error goes to a stderr that is None,
+        # so a mistyped shortcut would be a launcher that silently never
+        # appears: the failure this module exists to prevent.
+        if exc.code and sys.stderr is None:
+            _message_box("quietlaunch", "Could not read the arguments:\n\n"
+                         + " ".join(argv) + "\n\n"
+                         "Run `python -m quietlaunch --help` in a console.")
+        raise
+    cfg = LaunchConfig(streamlit_args=tuple(extra), **vars(ns))
+    return launch(cfg)
 
 
 if __name__ == "__main__":
