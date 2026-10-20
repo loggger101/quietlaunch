@@ -9,8 +9,12 @@
 """
 
 import http.server
+import socketserver
 import sys
 import time
+
+# A restarted test may land on a port its predecessor left in TIME_WAIT.
+socketserver.TCPServer.allow_reuse_address = True
 
 
 class _Health(http.server.BaseHTTPRequestHandler):
@@ -42,8 +46,16 @@ def main():
     if mode in ("serve", "slow"):
         if mode == "slow":
             _Health.delay = 3.0
-        print("fake streamlit serving on %d" % port, flush=True)
-        http.server.HTTPServer(("127.0.0.1", port), _Health).serve_forever()
+        t0 = time.time()
+        print("fake streamlit binding %d" % port, flush=True)
+        # socketserver's TCPServer, not http.server's HTTPServer: the latter's
+        # server_bind calls socket.getfqdn() between bind and listen, a reverse
+        # DNS lookup that can stall long enough on a CI runner that the port
+        # is not listening when the test gives up.
+        server = socketserver.TCPServer(("127.0.0.1", port), _Health)
+        print("fake streamlit listening on %d after %.2fs"
+              % (port, time.time() - t0), flush=True)
+        server.serve_forever()
     elif mode == "parent":
         # Streamlit's shape: the process the launcher spawned is not the only
         # one. The child serves; this one only waits, so killing just this pid

@@ -83,25 +83,30 @@ def serve_other(tmp_path):
 
     def start(port, mode="serve"):
         """Spawn a stranger's server on `port` and wait until it answers."""
-        p = subprocess.Popen([sys.executable, FAKE, str(port), mode],
-                             stdout=subprocess.DEVNULL)
+        log = tmp_path / ("other-%d.log" % port)
+        with open(log, "w", encoding="utf-8") as out:
+            p = subprocess.Popen([sys.executable, FAKE, str(port), mode],
+                                 stdout=out, stderr=subprocess.STDOUT)
         procs.append(p)
-        wait_for(lambda: launcher._port_answers(port))
+        wait_for(lambda: launcher._port_answers(port),
+                 why=lambda: "fake server on %d (exit %s) said: %r"
+                 % (port, p.poll(), log.read_text(encoding="utf-8")))
         return p
     yield start
     for p in procs:
         launcher._stop(p)
 
 
-def wait_for(cond, timeout=15.0):
-    """Poll `cond` until true; fail the test if it never is."""
+def wait_for(cond, timeout=15.0, why=None):
+    """Poll `cond` until true; fail the test if it never is, saying `why()`."""
     import time
     deadline = time.time() + timeout
     while time.time() < deadline:
         if cond():
             return
         time.sleep(0.05)
-    raise AssertionError("condition never became true")
+    raise AssertionError("condition never became true"
+                         + (": " + why() if why else ""))
 
 
 # ---------------------------------------------------------------- Tk stand-ins
