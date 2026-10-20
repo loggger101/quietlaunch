@@ -13,13 +13,12 @@ WHY THIS EXISTS. `streamlit run app.py` in a console makes the console window
 the app: closing it stops the server, and it has to stay open and in the way
 for as long as the dashboard is up. That is the terminal this removes.
 
-Removing it costs more than hiding it, which is the whole design here. A
-`pythonw` process with no console has no window to close and no output to read,
-so a failed start is a program that silently does not appear, and a successful
-one is a server nobody can stop without Task Manager. So this launcher puts up
-a small control window instead: it says what is happening while Streamlit boots,
-opens the browser once the port actually answers, and stops the server when it
-is closed. The window replaces the console rather than merely suppressing it.
+Removing the console takes more than hiding it. A `pythonw` process with no
+console has no window to close and no output to read, so a failed start is a
+program that silently does not appear, and a successful one is a server nobody
+can stop without Task Manager. So this launcher puts up a small control window
+instead: it says what is happening while Streamlit boots, opens the browser
+once the port actually answers, and stops the server when it is closed.
 
 IT NEVER IMPORTS THE APP. It spawns `streamlit run <app>` as a child and
 watches a socket. That is deliberate: this process is the one thing that must
@@ -28,8 +27,7 @@ a large model and a multiprocessing pool) inside the supervisor, and could make
 this process a worker's `__main__`. Standard library only, for the same reason.
 
 ASCII ONLY. Nothing here is printed to a redirected stdout, but Windows picks
-cp1252 for one, the rule is cheap to keep, and the log file this writes is read
-by the same eyes.
+cp1252 for one, and the rule is cheap to keep.
 
 Extracted from economicspace's `launch_ui.py`, whose history this repository
 carries; each Windows trap noted below was hit there first.
@@ -323,10 +321,10 @@ def _pid_alive(pid):
 
     POSIX gets `kill(pid, 0)`. Windows has no such call, so this opens the
     process with QUERY_LIMITED_INFORMATION and reads its exit code:
-    STILL_ACTIVE (259) means alive. That constant is genuinely ambiguous in
-    Win32, since a process may exit WITH code 259, but nothing here exits with
-    a code at all, and the alternative, a full snapshot walk, costs far more
-    for the same answer.
+    STILL_ACTIVE (259) means alive. That constant is ambiguous in Win32, since
+    a process may exit WITH code 259, but nothing here exits with a code at
+    all, and the alternative, a full snapshot walk, costs far more for the same
+    answer.
     """
     if os.name != "nt":
         try:
@@ -384,9 +382,8 @@ def _choose_port(cfg):
 def _tail(path, lines=14):
     """Last few lines of a log file for the failure message, or "" if unreadable.
 
-    Under `pythonw` there is no console, so this text IS the error report; a
-    boot failure that could not say why is the whole reason the launcher grew a
-    window rather than merely hiding the console.
+    Under `pythonw` there is no console, so this text IS the error report. The
+    launcher has a window at all so that a failed boot can say why.
     """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -691,9 +688,9 @@ class Launcher(object):
         `(proc, logfile)` atomic against the hand-over in `_boot_inner`, because
         closing the window mid-spawn otherwise found `proc` still None, killed
         nothing, and left a server that nothing on screen could stop. And the
-        pending `after` is CANCELLED rather than merely left unscheduled:
-        setting `stopping` stops the pump rescheduling, but the one already in
-        flight still fires, into a destroyed interpreter.
+        pending `after` is CANCELLED: setting `stopping` stops the pump
+        rescheduling, but the one already queued still fires, into a destroyed
+        interpreter.
         """
         with self.lock:
             if self.stopping:
@@ -768,7 +765,7 @@ class Launcher(object):
     def _boot(self):
         """Worker-thread entry point: run the boot sequence, report any exception.
 
-        The bare `except` is the point. This runs on a daemon thread under
+        It catches every Exception on purpose. This runs on a daemon thread under
         `pythonw`, where an unhandled traceback goes nowhere at all, so every
         failure has to come back through `_done_booting` and onto the window.
         """
@@ -832,7 +829,7 @@ class Launcher(object):
             # And then this process GOES AWAY. It supervises nothing -- proc is
             # None -- so leaving its window up would put a second "Stop and
             # quit" button on screen that cannot stop anything, next to the one
-            # that can. One dashboard, one control window.
+            # that can.
             self._done_booting(True, "Already running -- reopening it in your"
                                      " browser.", self.url)
             self._post(self.open_browser)
@@ -920,7 +917,7 @@ def launch(cfg):
         # 2026-10-18 it opened the browser and said "The dashboard is at ..."
         # whether the server had answered, died at import, or timed out --
         # under pythonw, the one message anybody would see, and it was wrong
-        # exactly when it mattered.
+        # whenever the boot failed.
         port, running = _choose_port(cfg)
         url = "http://localhost:%d" % port
         if not running:
