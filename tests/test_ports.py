@@ -16,7 +16,7 @@ def _listener(host, reuse):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if reuse:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, 0 if host == "127.0.0.1" else free_port()))
+    s.bind((host, free_port()))
     s.listen(1)
     return s
 

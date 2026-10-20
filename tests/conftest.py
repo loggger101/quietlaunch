@@ -20,10 +20,27 @@ FAKE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def free_port():
-    """A port nothing holds right now, chosen by the OS."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A port nothing holds right now, BELOW every OS's ephemeral range.
+
+    Not `bind(0)`: that hands out an ephemeral port, and macOS allocates those
+    in sequence, so the port a test picked (and the one after it) is what the
+    next client socket takes as its own source port -- including the
+    launcher's own probe of it. The tests then saw ports held, or a probe
+    connected to itself, on macOS runners only. 20000-32000 sits below the
+    ephemeral ranges of Windows and macOS (49152+) and Linux (32768+), as
+    Streamlit's real 8501 does.
+    """
+    import random
+    rng = random.Random()
+    for _ in range(200):
+        port = rng.randrange(20000, 32000)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError("no free port found below the ephemeral range")
 
 
 @pytest.fixture
