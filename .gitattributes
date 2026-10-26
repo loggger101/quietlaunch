@@ -10,3 +10,8 @@
 .gitignore     text eol=lf
 .gitattributes text eol=lf
 LICENSE        text eol=lf
+
+# samebytes' stat-cache hook (.githooks/) MUST be LF: core.autocrlf is true in
+# Git for Windows' system config, and a CRLF `#!/bin/sh` fails as "bad
+# interpreter", silently, after every checkout.
+.githooks/*  text eol=lf

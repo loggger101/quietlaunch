@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs after merge / pull.  See drive-restat.sh for why.
+exec "$(dirname "$0")/drive-restat.sh"
