@@ -62,8 +62,8 @@ sys.exit(quietlaunch.launch(quietlaunch.LaunchConfig(
 )))
 ```
 
-`python -m quietlaunch --help` lists every option; each sets a `LaunchConfig`
-field:
+`python -m quietlaunch --help` lists every option, and `--version` prints the
+version. Each option sets a `LaunchConfig` field:
 
 | field | flag | default | what |
 |---|---|---|---|

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **`--version`** prints `quietlaunch X.Y.Z`, read from
+  `quietlaunch.__version__`.
+- README names each option's command-line flag beside its `LaunchConfig`
+  field, and the docs describe what happens rather than how much it matters.
+- Tests pick ports below every OS's ephemeral range, so they pass on macOS,
+  and the fake server listens without a reverse-DNS lookup.
+- `.githooks/` carries samebytes' stat-cache hook for working copies in a
+  synced folder; CI's `hooks` job checks the copies against the samebytes tag.
+- CI runs `actions/checkout@v5` and `actions/setup-python@v6`, which run on
+  Node 24; the v4 and v5 they replace targeted the deprecated Node 20.
+- Package metadata lists each supported Python version and macOS, and links
+  the issue tracker and this changelog.
+
 ## v0.1.0 (2026-10-20)
 
 First release: economicspace's `launch_ui.py` (as of economicspace d9c6093),

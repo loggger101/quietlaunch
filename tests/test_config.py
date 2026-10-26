@@ -102,3 +102,13 @@ def test_cli_defaults_match_the_dataclass(tmp_path, monkeypatch):
     app = str(tmp_path / "ui.py")
     launcher.main([app])
     assert seen[0] == LaunchConfig(app=app)
+
+
+def test_cli_version_is_the_package_version(capsys):
+    """`--version` names the version pyproject.toml reads, and exits 0."""
+    import quietlaunch
+    with pytest.raises(SystemExit) as exc:
+        launcher.main(["--version"])
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == (
+        "quietlaunch " + quietlaunch.__version__)

@@ -19,13 +19,22 @@ keywords = [
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
     "Environment :: Win32 (MS Windows)",
     "Environment :: X11 Applications",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Desktop Environment",
     "Topic :: Software Development :: User Interfaces",
 ]
@@ -40,6 +49,8 @@ test = ["pytest>=7.0"]
 
 [project.urls]
 Repository = "https://github.com/loggger101/quietlaunch"
+Issues = "https://github.com/loggger101/quietlaunch/issues"
+Changelog = "https://github.com/loggger101/quietlaunch/blob/main/CHANGELOG.md"
 
 # A gui-script, so on Windows the installed `quietlaunch.exe` starts with no
 # console, which is the point of the package.
