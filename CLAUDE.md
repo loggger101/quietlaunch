@@ -5,8 +5,9 @@ its code is a Windows trap with its reason beside it; README's "Why it looks
 the way it does" is the list. Rules:
 
 - **Standard library only, ASCII only, a docstring on every definition.**
-  `tests/test_rules.py` enforces all three. The supervisor is the one process
-  that must not fail, so it imports nothing it could lack.
+  `tests/test_rules.py` enforces all three, through `samebytes.source` (a
+  test extra). The supervisor is the one process that must not fail, so it
+  imports nothing it could lack.
 - **Never import the app.** It spawns `streamlit run <app>` and watches a
   socket; putting the app's imports inside the supervisor is the failure this
   design exists to avoid.
