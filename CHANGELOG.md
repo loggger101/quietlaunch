@@ -14,6 +14,10 @@
   Node 24; the v4 and v5 they replace targeted the deprecated Node 20.
 - Package metadata lists each supported Python version and macOS, and links
   the issue tracker and this changelog.
+- `tests/test_rules.py` runs its rules through `samebytes.source` (v0.3.0, a
+  test extra), the copy the family shares. The import rule now answers on
+  Python 3.9 instead of skipping there, and async definitions need a
+  docstring too.
 
 ## v0.1.0 (2026-10-20)
 
