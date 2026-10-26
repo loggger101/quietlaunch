@@ -1001,6 +1001,14 @@ def _parser():
                    help="requirements file for the first-run install")
     p.add_argument("--no-install", action="store_false", dest="auto_install",
                    help="never pip-install Streamlit")
+    # Read here, not at import: `__init__` imports this module, and run as a
+    # script there is no package to read it from.
+    try:
+        from . import __version__ as version
+    except ImportError:
+        version = "unknown"
+    p.add_argument("--version", action="version",
+                   version="quietlaunch %s" % version)
     return p
 
 
