@@ -18,6 +18,10 @@
   test extra), the copy the family shares. The import rule now answers on
   Python 3.9 instead of skipping there, and async definitions need a
   docstring too.
+- samebytes v0.5.0 in the test extra and in CI's `hooks` job, which had sat on
+  v0.1.0; `tests/test_rules.py` holds every git pin to one ref and every
+  `LaunchConfig` field to a help comment. `port_tries` gets its own: the
+  comment above it was written for `port_first` and reached only that field.
 
 ## v0.1.0 (2026-10-20)
 
