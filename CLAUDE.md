@@ -26,4 +26,5 @@ the way it does" is the list. Rules:
 - The tree lives in OneDrive. `*-DESKTOP-*` files are sync-conflict copies:
   diff, then delete; never commit one. Never `git stash`. `.githooks/` is
   samebytes' stat-cache hook (opt in with `git config core.hooksPath
-  .githooks`); CI's `hooks` job holds the copies to the samebytes tag it names.
+  .githooks`); CI's `hooks` job holds the copies to the samebytes tag the test
+  extra pins, and `tests/test_rules.py` holds every git pin to one ref.
