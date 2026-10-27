@@ -38,7 +38,8 @@ jobs:
   # .githooks/ holds samebytes' stat-cache hook (this tree lives in a synced
   # folder).  Drift, CRLF, a missing eol=lf pin or a missing executable bit
   # each make a copy silently useless after a checkout; this fails on any of
-  # them.  The tag is the samebytes release the copies came from.
+  # them.  The tag is the one pyproject's test extra pins (tests/test_rules.py
+  # holds the two to one ref); the hooks are unchanged since samebytes v0.1.0.
   hooks:
     runs-on: ubuntu-latest
     steps:
@@ -48,5 +49,5 @@ jobs:
           python-version: "3.14"
       - name: Hooks match samebytes
         run: |
-          python -m pip install "samebytes @ git+https://github.com/loggger101/samebytes@v0.1.0"
+          python -m pip install "samebytes @ git+https://github.com/loggger101/samebytes@v0.5.0"
           python -m samebytes hooks check .

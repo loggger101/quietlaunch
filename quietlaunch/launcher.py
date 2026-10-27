@@ -103,7 +103,7 @@ class LaunchConfig:
     state_dir: Optional[str] = None
     # Ports tried, from `port_first` upwards.
     port_first: int = PORT_FIRST
-    port_tries: int = PORT_TRIES
+    port_tries: int = PORT_TRIES   # how many ports, counting port_first
     # How long a boot may take before it is reported as failed.
     boot_timeout_s: float = BOOT_TIMEOUT_S
     # Install Streamlit on first use if it is not importable.
